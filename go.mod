@@ -63,6 +63,7 @@ require (
 )
 
 require (
+	beryju.io/gravity v0.8.1
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.10.0
 	github.com/G-Core/gcore-dns-sdk-go v0.2.8
 	github.com/fatih/color v1.16.0
@@ -139,7 +140,7 @@ require (
 	github.com/ryanuber/go-glob v1.0.0 // indirect
 	github.com/sergi/go-diff v1.2.0 // indirect
 	github.com/shopspring/decimal v1.3.1 // indirect
-	github.com/sirupsen/logrus v1.9.0 // indirect
+	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/softlayer/xmlrpc v0.0.0-20200409220501-5f089df7cb7e // indirect
 	github.com/stretchr/objx v0.5.2 // indirect
 	github.com/xrash/smetrics v0.0.0-20201216005158-039620a65673 // indirect
