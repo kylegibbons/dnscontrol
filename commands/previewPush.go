@@ -259,9 +259,9 @@ func run(args PreviewArgs, push bool, interactive bool, out printer.CLI, report 
 					Corrections: len(corrections),
 					Provider:    provider.Name,
 				})
+
 				anyErrors = printOrRunCorrections(domain.Name, provider.Name, corrections, out, push, interactive, notifier) || anyErrors
 			}
-
 			//
 			run := args.shouldRunProvider(domain.RegistrarName, domain)
 			out.StartRegistrar(domain.RegistrarName, !run)
@@ -577,16 +577,21 @@ func printOrRunCorrections(domain string, provider string, corrections []*models
 		out.PrintCorrection(i, correction)
 		var err error
 		if push {
+
 			if interactive && !out.PromptToRun() {
 				continue
 			}
+
 			if correction.F != nil {
+
 				err = correction.F()
+
 				out.EndCorrection(err)
 				if err != nil {
 					anyErrors = true
 				}
 			}
+
 		}
 		notifier.Notify(domain, provider, correction.Msg, err, !push)
 	}

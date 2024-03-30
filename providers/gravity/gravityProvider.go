@@ -3,18 +3,17 @@ package gravity
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
 	"strings"
-
-	"golang.org/x/net/idna"
 
 	"beryju.io/gravity/api"
 	"github.com/StackExchange/dnscontrol/v4/models"
 	"github.com/StackExchange/dnscontrol/v4/pkg/diff2"
 	"github.com/StackExchange/dnscontrol/v4/pkg/printer"
-	"github.com/StackExchange/dnscontrol/v4/pkg/transform"
 	"github.com/StackExchange/dnscontrol/v4/providers"
-	"github.com/cloudflare/cloudflare-go"
 	"github.com/fatih/color"
+	httptransport "github.com/go-openapi/runtime/client"
 )
 
 var _ = api.ContextServerVariables
@@ -57,44 +56,45 @@ func init() {
 
 // gravityProvider is the handle for API calls.
 type gravityProvider struct {
-	domainIndex     map[string]string // Call c.fetchDomainList() to populate before use.
-	nameservers     map[string][]string
-	ipConversions   []transform.IPConversion
-	ignoredLabels   []string
-	manageRedirects bool
-	manageWorkers   bool
-	accountID       string
-	gravityClient   *api.APIClient
+	zones         map[string]api.DnsAPIZone // Call c.fetchDomainList() to populate before use.
+	nameservers   map[string][]string
+	gravityClient *api.APIClient
 }
 
 // GetNameservers returns the nameservers for a domain.
 func (p *gravityProvider) GetNameservers(domain string) ([]*models.Nameserver, error) {
-	if p.domainIndex == nil {
+	fmt.Println("In Get Nameservers")
+	if p.zones == nil {
 		if err := p.fetchDomainList(); err != nil {
 			return nil, err
 		}
 	}
 	ns, ok := p.nameservers[domain]
 	if !ok {
-		return nil, fmt.Errorf("nameservers for %s not found in cloudflare account", domain)
+		return nil, fmt.Errorf("nameservers for %s not found in Gravity", domain)
 	}
 	return models.ToNameservers(ns)
 }
 
 // ListZones returns a list of the DNS zones.
 func (p *gravityProvider) ListZones() ([]string, error) {
+
+	fmt.Println("in List Zones")
+
 	if err := p.fetchDomainList(); err != nil {
 		return nil, err
 	}
-	zones := make([]string, 0, len(p.domainIndex))
-	for d := range p.domainIndex {
-		zones = append(zones, d)
+	zones := make([]string, 0, len(p.zones))
+	for d := range p.zones {
+		zones = append(zones, strings.TrimSuffix(d, "."))
 	}
 	return zones, nil
 }
 
 // GetZoneRecords gets the records of a zone and returns them in RecordConfig format.
 func (p *gravityProvider) GetZoneRecords(domain string, meta map[string]string) (models.Records, error) {
+
+	fmt.Println("Getting Zone Records")
 
 	records, err := p.getRecordsForDomain(domain)
 	if err != nil {
@@ -105,14 +105,6 @@ func (p *gravityProvider) GetZoneRecords(domain string, meta map[string]string) 
 		if rec.TTL == 0 {
 			rec.TTL = 1
 		}
-		// Store the proxy status ("orange cloud") for use by get-zones:
-		m := getProxyMetadata(rec)
-		if p, ok := m["proxy"]; ok {
-			if rec.Metadata == nil {
-				rec.Metadata = map[string]string{}
-			}
-			rec.Metadata["cloudflare_proxy"] = p
-		}
 	}
 
 	// Normalize
@@ -121,30 +113,17 @@ func (p *gravityProvider) GetZoneRecords(domain string, meta map[string]string) 
 	return records, nil
 }
 
-func (p *gravityProvider) getDomainID(name string) (string, error) {
-	if p.domainIndex == nil {
-		if err := p.fetchDomainList(); err != nil {
-			return "", err
-		}
-	}
-	id, ok := p.domainIndex[name]
-	if !ok {
-		return "", fmt.Errorf("'%s' not a zone in Gravity", name)
-	}
-	return id, nil
-}
-
 // GetZoneRecordsCorrections returns a list of corrections that will turn existing records into dc.Records.
 func (p *gravityProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, records models.Records) ([]*models.Correction, error) {
-
-	checkNSModifications(dc)
+	fmt.Println("looking for Gravity corrections")
+	// checkNSModifications(dc)
 
 	// domainID, err := p.getDomainID(dc.Name)
 	// if err != nil {
 	// 	return nil, err
 	// }
 
-	checkNSModifications(dc)
+	// checkNSModifications(dc)
 
 	var corrections []*models.Correction
 
@@ -171,9 +150,8 @@ func (p *gravityProvider) GetZoneRecordsCorrections(dc *models.DomainConfig, rec
 			corrs = p.mkChangeCorrection(oldrec, newrec, dc.Name, msg)
 		case diff2.DELETE:
 			deleteRec := inst.Old[0]
-			deleteRecType := deleteRec.Type
 			deleteRecOrig := deleteRec.Original
-			corrs = p.mkDeleteCorrection(deleteRecType, deleteRecOrig, dc.Name, msg)
+			corrs = p.mkDeleteCorrection(deleteRecOrig, dc.Name, msg)
 		}
 
 		corrections = append(corrections, corrs...)
@@ -200,16 +178,14 @@ func genComparable(rec *models.RecordConfig) string {
 }
 
 func (p *gravityProvider) mkCreateCorrection(newrec *models.RecordConfig, domainName, msg string) []*models.Correction {
-
 	return p.createRecDiff2(newrec, domainName, msg)
-
 }
 
 func (p *gravityProvider) mkChangeCorrection(oldrec, newrec *models.RecordConfig, hostname string, msg string) []*models.Correction {
 
-	idTxt := oldrec.Original.(cloudflare.DNSRecord).ID
+	idTxt := oldrec.Original.(api.DnsAPIRecord).Hostname
 
-	msg = msg + color.YellowString(" id=%v", idTxt)
+	msg = msg + color.YellowString(" hostname=%v", idTxt)
 
 	return []*models.Correction{{
 		Msg: msg,
@@ -218,39 +194,40 @@ func (p *gravityProvider) mkChangeCorrection(oldrec, newrec *models.RecordConfig
 
 }
 
-func (p *gravityProvider) mkDeleteCorrection(recType string, origRec any, domainID string, msg string) []*models.Correction {
+func (p *gravityProvider) mkDeleteCorrection(origRec any, domainID string, msg string) []*models.Correction {
 
-	idTxt := origRec.(cloudflare.DNSRecord).ID
+	idTxt := origRec.(api.DnsAPIRecord).Hostname
+	zone := origRec.(api.DnsAPIRecord).Fqdn
 
-	msg = msg + color.RedString(" id=%v", idTxt)
+	msg = msg + color.RedString(" hostname=%v", idTxt)
 
 	correction := &models.Correction{
 		Msg: msg,
 		F: func() error {
-			return p.deleteDNSRecord(domainID)
+			return p.deleteDNSRecord(zone, domainID)
 		},
 	}
 	return []*models.Correction{correction}
 }
 
-func checkNSModifications(dc *models.DomainConfig) {
-	newList := make([]*models.RecordConfig, 0, len(dc.Records))
+// func checkNSModifications(dc *models.DomainConfig) {
+// 	newList := make([]*models.RecordConfig, 0, len(dc.Records))
 
-	punyRoot, err := idna.ToASCII(dc.Name)
-	if err != nil {
-		punyRoot = dc.Name
-	}
+// 	punyRoot, err := idna.ToASCII(dc.Name)
+// 	if err != nil {
+// 		punyRoot = dc.Name
+// 	}
 
-	for _, rec := range dc.Records {
-		if rec.Type == "NS" && rec.GetLabelFQDN() == punyRoot {
-			if strings.HasSuffix(rec.GetTargetField(), ".ns.cloudflare.com.") {
-				continue
-			}
-		}
-		newList = append(newList, rec)
-	}
-	dc.Records = newList
-}
+// 	for _, rec := range dc.Records {
+// 		if rec.Type == "NS" && rec.GetLabelFQDN() == punyRoot {
+// 			if strings.HasSuffix(rec.GetTargetField(), ".ns.cloudflare.com.") {
+// 				continue
+// 			}
+// 		}
+// 		newList = append(newList, rec)
+// 	}
+// 	dc.Records = newList
+// }
 
 const (
 	metaProxy         = "cloudflare_proxy"
@@ -261,20 +238,58 @@ const (
 
 func newGravity(m map[string]string, metadata json.RawMessage) (providers.DNSServiceProvider, error) {
 	p := &gravityProvider{}
-	// check api keys from creds json file
-	if m["apitoken"] == "" && (m["apikey"] == "" || m["apiuser"] == "") {
-		return nil, fmt.Errorf("if cloudflare apitoken is not set, apikey and apiuser must be provided")
-	}
-	if m["apitoken"] != "" && (m["apikey"] != "" || m["apiuser"] != "") {
-		return nil, fmt.Errorf("if cloudflare apitoken is set, apikey and apiuser should not be provided")
+
+	if m["apitoken"] == "" {
+		return nil, fmt.Errorf("apitoken is required")
 	}
 
-	p.gravityClient = api.NewAPIClient(&api.Configuration{})
+	if m["url"] == "" {
+		return nil, fmt.Errorf("url is required")
+	}
+
+	insecure := false
+
+	if strings.ToLower(m["InsecureSkipVerify"]) == "true" {
+		insecure = true
+	}
+
+	debug := false
+
+	if strings.ToLower(m["debug"]) == "true" {
+		debug = true
+	}
+
+	gURL, err := url.Parse(m["url"])
+	if err != nil {
+		return nil, err
+	}
+
+	config := api.NewConfiguration()
+	config.Debug = debug
+	config.UserAgent = fmt.Sprintf("dnscontrol-gravity")
+	config.Host = gURL.Host
+	config.Scheme = gURL.Scheme
+
+	tlsTransport, err := httptransport.TLSTransport(httptransport.TLSClientOptions{
+		InsecureSkipVerify: insecure,
+	})
+
+	if err != nil {
+		return p, err
+	}
+
+	config.HTTPClient = &http.Client{
+		Transport: tlsTransport,
+	}
+
+	config.AddDefaultHeader("Authorization", fmt.Sprintf("Bearer %s", m["apitoken"]))
+
+	p.gravityClient = api.NewAPIClient(config)
 
 	// Check account data if set
-	if m["accountid"] != "" {
-		p.accountID = m["accountid"]
-	}
+	// if m["accountid"] != "" {
+	// 	p.accountID = m["accountid"]
+	// }
 
 	// debug, err := strconv.ParseBool(os.Getenv("CLOUDFLAREAPI_DEBUG"))
 	// if err == nil {
@@ -291,73 +306,19 @@ func newGravity(m map[string]string, metadata json.RawMessage) (providers.DNSSer
 			return nil, err
 		}
 		// ignored_labels:
-		p.ignoredLabels = append(p.ignoredLabels, parsedMeta.IgnoredLabels...)
-		if len(p.ignoredLabels) > 0 {
-			printer.Warnf("Cloudflare 'ignored_labels' configuration is deprecated and might be removed. Please use the IGNORE domain directive to achieve the same effect.\n")
-		}
-		// parse provider level metadata
-		if len(parsedMeta.IPConversions) > 0 {
-			p.ipConversions, err = transform.DecodeTransformTable(parsedMeta.IPConversions)
-			if err != nil {
-				return nil, err
-			}
-		}
+		// p.ignoredLabels = append(p.ignoredLabels, parsedMeta.IgnoredLabels...)
+		// if len(p.ignoredLabels) > 0 {
+		// 	printer.Warnf("Cloudflare 'ignored_labels' configuration is deprecated and might be removed. Please use the IGNORE domain directive to achieve the same effect.\n")
+		// }
+		// // parse provider level metadata
+		// if len(parsedMeta.IPConversions) > 0 {
+		// 	p.ipConversions, err = transform.DecodeTransformTable(parsedMeta.IPConversions)
+		// 	if err != nil {
+		// 		return nil, err
+		// 	}
+		// }
 	}
 	return p, nil
-}
-
-// Used on the "existing" records.
-type cfRecData struct {
-	Name     string   `json:"name"`
-	Target   cfTarget `json:"target"`
-	Service  string   `json:"service"`  // SRV
-	Proto    string   `json:"proto"`    // SRV
-	Priority uint16   `json:"priority"` // SRV
-	Weight   uint16   `json:"weight"`   // SRV
-	Port     uint16   `json:"port"`     // SRV
-}
-
-// cfTarget is a SRV target. A null target is represented by an empty string, but
-// a dot is so acceptable.
-type cfTarget string
-
-// UnmarshalJSON decodes a SRV target from the Cloudflare API. A null target is
-// represented by a false boolean or a dot. Domain names are FQDNs without a
-// trailing period (as of 2019-11-05).
-func (c *cfTarget) UnmarshalJSON(data []byte) error {
-	var obj interface{}
-	if err := json.Unmarshal(data, &obj); err != nil {
-		return err
-	}
-	switch v := obj.(type) {
-	case string:
-		*c = cfTarget(v)
-	case bool:
-		if v {
-			panic("unknown value for cfTarget bool: true")
-		}
-		*c = "" // the "." is already added by nativeToRecord
-	}
-	return nil
-}
-
-// MarshalJSON encodes cfTarget for the Cloudflare API. Null targets are
-// represented by a single period.
-func (c cfTarget) MarshalJSON() ([]byte, error) {
-	var obj string
-	switch c {
-	case "", ".":
-		obj = "."
-	default:
-		obj = string(c)
-	}
-	return json.Marshal(obj)
-}
-
-// DNSControlString returns cfTarget normalized to be a FQDN. Null targets are
-// represented by a single period.
-func (c cfTarget) FQDN() string {
-	return strings.TrimRight(string(c), ".") + "."
 }
 
 // uint16Zero converts value to uint16 or returns 0.
@@ -388,42 +349,25 @@ func int32Zero(value interface{}) *int32 {
 	return &retValue
 }
 
-// intZero converts value to int or returns 0.
-func intZero(value interface{}) int {
-	switch v := value.(type) {
-	case float64:
-		return int(v)
-	case int:
-		return v
-	case nil:
-	}
-	return 0
-}
-
-// stringDefault returns the value as a string or returns the default value if nil.
-func stringDefault(value interface{}, def string) string {
-	switch v := value.(type) {
-	case string:
-		return v
-	case nil:
-	}
-	return def
-}
-
 func (p *gravityProvider) nativeToRecord(domain string, native api.DnsAPIRecord) (*models.RecordConfig, error) {
 
+	domain = strings.TrimSuffix(domain, ".")
+
 	// normalize cname,mx,ns records with dots to be consistent with our config format.
-	if native.Type == "CNAME" || native.Type == "MX" || native.Type == "NS" || native.Type == "PTR" {
-		if native.Data != "." {
-			native.Data = native.Data + "."
-		}
-	}
+	// if native.Type == "CNAME" || native.Type == "MX" || native.Type == "NS" || native.Type == "PTR" {
+	// 	if native.Data != "." {
+	// native.Data = native.Data
+	// 	}
+	// }
+
+	native.Hostname = strings.TrimSuffix(native.Hostname, ".")
 
 	rc := &models.RecordConfig{
 		TTL:      uint32(0),
 		Original: native,
 		Metadata: map[string]string{},
 	}
+	rc.SetTarget(native.Data)
 	rc.SetLabelFromFQDN(native.Hostname, domain)
 
 	switch rType := native.Type; rType { // #rtype_variations
@@ -454,34 +398,26 @@ func (p *gravityProvider) nativeToRecord(domain string, native api.DnsAPIRecord)
 	return rc, nil
 }
 
-func getProxyMetadata(r *models.RecordConfig) map[string]string {
-	if r.Type != "A" && r.Type != "AAAA" && r.Type != "CNAME" {
-		return nil
-	}
-	var proxied bool
-	if r.Original != nil {
-		proxied = *r.Original.(cloudflare.DNSRecord).Proxied
-	} else {
-		proxied = r.Metadata[metaProxy] != "off"
-	}
-	return map[string]string{
-		"proxy": fmt.Sprint(proxied),
-	}
-}
-
 // EnsureZoneExists creates a zone if it does not exist
 func (p *gravityProvider) EnsureZoneExists(domain string) error {
-	if p.domainIndex == nil {
+
+	if p.zones == nil {
 		if err := p.fetchDomainList(); err != nil {
 			return err
 		}
 	}
-	if _, ok := p.domainIndex[domain]; ok {
+
+	d := domain
+
+	fmt.Printf("Comparing domain: %s\n", d)
+
+	if _, ok := p.zones[d]; ok {
 		return nil
 	}
 
 	err := p.createZone(domain, false, 300)
 	printer.Printf("Added zone for %s\n", domain)
-	p.domainIndex = nil // clear the index to let the following functions get a fresh list with nameservers etc..
+	p.zones = nil // clear the index to let the following functions get a fresh list with nameservers etc..
+
 	return err
 }
